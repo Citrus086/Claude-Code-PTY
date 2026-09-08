@@ -509,7 +509,15 @@ class CCMBackend(BasePTYBackend):
             self._im._tasks[instance_id] = consumer
 
         if chat_initiated:
-            self._im._launch_params[instance_id] = {
+            # InstanceManager stages exact source/generation metadata before
+            # entering the adapter. Preserve that durable proof while adding
+            # the transport fields owned by this adapter. Replacing the
+            # dictionary would disable CCM's safe context-overflow
+            # compaction/retry path for PTY turns.
+            launch_params = dict(
+                self._im._launch_params.get(instance_id) or {}
+            )
+            launch_params.update({
                 "prompt": prompt,
                 "task_id": task_id,
                 "cwd": cwd,
@@ -519,6 +527,7 @@ class CCMBackend(BasePTYBackend):
                 "effort_level": effort_level,
                 "enable_workflows": enable_workflows,
                 "enabled_skills": enabled_skills,
-            }
+            })
+            self._im._launch_params[instance_id] = launch_params
 
         return session_id

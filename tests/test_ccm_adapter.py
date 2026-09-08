@@ -260,6 +260,45 @@ class TestExitCleanupIdentity:
         assert 5 not in im._tasks
 
 
+class TestLaunchMetadata:
+    async def test_launch_preserves_manager_turn_proof_fields(self, backend):
+        """Adapter transport fields must merge with CCM's exact turn cache."""
+        im = backend._im
+        im._launch_params[8] = {
+            "source_log_id": 1234,
+            "task_turn_generation": 7,
+            "provider": "claude",
+            "current_message": "continue",
+            "queue_timestamp": 12.5,
+        }
+        session = SimpleNamespace(
+            session_id="metadata-session",
+            _process=SimpleNamespace(pid=4253),
+        )
+
+        async def fake_launch(**kwargs):
+            backend._sessions[kwargs["key"]] = session
+            return session.session_id
+
+        backend.launch = fake_launch
+        backend._consumers[8] = asyncio.current_task()
+
+        await backend.launch_for_ccm(
+            instance_id=8,
+            prompt="continue",
+            task_id=42,
+            cwd="/workspace",
+            chat_initiated=True,
+        )
+
+        params = im._launch_params[8]
+        assert params["source_log_id"] == 1234
+        assert params["task_turn_generation"] == 7
+        assert params["provider"] == "claude"
+        assert params["current_message"] == "continue"
+        assert params["queue_timestamp"] == 12.5
+
+
 class TestForceKillScoping:
     async def test_mismatched_slot_kills_only_expected_session(self, backend):
         expected = _StoppableSession("sid-old")
