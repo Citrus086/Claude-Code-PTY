@@ -801,6 +801,12 @@ class Session:
         # it queues the prompt and echoes it when the new turn begins.)
         turn_started = False
         prompt_echo_matcher = self._new_prompt_echo_matcher(text)
+        # During a cold resume Claude may still be finishing its automatic
+        # continuation when this prompt reaches stdin. In that case it emits
+        # exact enqueue -> remove queue records and folds the prompt into the
+        # in-flight turn without ever writing a standalone user echo. Track
+        # that queue edge as an alternate, content-bound turn boundary.
+        prompt_enqueued = False
         steer_followup_prompt: str | None = None
         steer_followup_echo_matcher = None
         steer_followup_started = False
@@ -846,6 +852,7 @@ class Session:
                 enqueued_pending_in_batch: _PendingSteer | None = None
                 uncertain_terminal_in_batch: _PendingSteer | None = None
                 prompt_echo_ids: set[int] = set()
+                prompt_absorb_ids: set[int] = set()
                 for raw in messages:
                     if (
                         not scan_started
@@ -854,13 +861,32 @@ class Session:
                         scan_started = True
                         prompt_echo_ids.add(id(raw))
 
+                    operation = (
+                        raw.get("operation")
+                        if raw.get("type") == "queue-operation"
+                        else None
+                    )
+                    if not scan_started and operation == "enqueue":
+                        if self._queue_operation_matches_prompt(raw, text):
+                            prompt_enqueued = True
+                        elif prompt_enqueued:
+                            # A contentless remove cannot identify which of
+                            # multiple queued items it consumed. Require an
+                            # adjacent logical queue entry for fail-closed
+                            # attribution to this prompt.
+                            prompt_enqueued = False
+                    elif not scan_started and prompt_enqueued:
+                        if operation == "remove":
+                            scan_started = True
+                            prompt_absorb_ids.add(id(raw))
+                            prompt_enqueued = False
+                        elif operation == "dequeue":
+                            # A dequeued prompt starts a distinct turn and
+                            # therefore still needs its normal user echo.
+                            prompt_enqueued = False
+
                     pending = self._pending_steer
                     if pending is not None:
-                        operation = (
-                            raw.get("operation")
-                            if raw.get("type") == "queue-operation"
-                            else None
-                        )
                         if (
                             operation == "enqueue"
                             and raw.get("content") == pending.content
@@ -1034,7 +1060,7 @@ class Session:
                 if raw.get("isApiErrorMessage"):
                     api_error_turn = True
                 if not turn_started:
-                    if id(raw) in prompt_echo_ids:
+                    if id(raw) in prompt_echo_ids or id(raw) in prompt_absorb_ids:
                         turn_started = True
                         confirm_deadline = None  # delivery confirmed
                         if not (
