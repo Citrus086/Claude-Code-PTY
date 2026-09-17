@@ -857,10 +857,10 @@ class TestTurnAlignment:
             for e in events
         )
 
-    async def test_unrelated_enqueue_makes_prompt_remove_ambiguous(
+    async def test_prompt_remove_survives_later_notification_enqueues(
         self, tmp_path
     ):
-        """A child queue item between enqueue/remove cannot start our turn."""
+        """Later notifications do not hide the prompt's FIFO removal."""
 
         session = _make_session(tmp_path)
         prompt = "current status"
@@ -871,15 +871,11 @@ class TestTurnAlignment:
                 session,
                 _queue_operation("enqueue", prompt),
                 _queue_operation("enqueue", "<task-notification>done</task-notification>"),
+                _queue_operation("enqueue", "<task-notification>more</task-notification>"),
                 _queue_operation("remove"),
-                _assistant_text("unrelated reply"),
-                _turn_duration(),
-            )
-            await asyncio.sleep(0.02)
-            _append(
-                session,
-                _user_text(prompt),
-                _assistant_text("prompt reply"),
+                _queue_operation("remove"),
+                _queue_operation("remove"),
+                _assistant_text("merged reply"),
                 _turn_duration(),
             )
 
@@ -888,10 +884,42 @@ class TestTurnAlignment:
         await writer
 
         assert any(
-            e.orphan and e.content == "unrelated reply" for e in events
+            not e.orphan and e.content == "merged reply" for e in events
+        )
+        assert not any(
+            e.event_type == EventType.SYSTEM_EVENT and e.is_error
+            for e in events
+        )
+
+    async def test_prior_notification_remove_does_not_start_prompt_early(
+        self, tmp_path
+    ):
+        session = _make_session(tmp_path)
+        prompt = "current status"
+
+        async def cc_responds():
+            await asyncio.sleep(0.02)
+            _append(
+                session,
+                _queue_operation("enqueue", "<task-notification>done</task-notification>"),
+                _queue_operation("enqueue", prompt),
+                _queue_operation("remove"),
+                _assistant_text("notification reply"),
+                _turn_duration(),
+                _queue_operation("remove"),
+                _assistant_text("merged prompt reply"),
+                _turn_duration(),
+            )
+
+        writer = asyncio.create_task(cc_responds())
+        events = [e async for e in session.send_prompt(prompt, timeout=0.5)]
+        await writer
+
+        assert any(
+            e.orphan and e.content == "notification reply" for e in events
         )
         assert any(
-            not e.orphan and e.content == "prompt reply" for e in events
+            not e.orphan and e.content == "merged prompt reply" for e in events
         )
 
     async def test_matching_enqueue_dequeue_still_waits_for_prompt_echo(

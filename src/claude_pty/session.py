@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 import dataclasses
 import logging
 import os
@@ -803,10 +804,11 @@ class Session:
         prompt_echo_matcher = self._new_prompt_echo_matcher(text)
         # During a cold resume Claude may still be finishing its automatic
         # continuation when this prompt reaches stdin. In that case it emits
-        # exact enqueue -> remove queue records and folds the prompt into the
-        # in-flight turn without ever writing a standalone user echo. Track
-        # that queue edge as an alternate, content-bound turn boundary.
-        prompt_enqueued = False
+        # enqueue -> remove queue records and folds the prompt into the
+        # in-flight turn without ever writing a standalone user echo. Other
+        # notifications can join the same queue, so retain their FIFO order
+        # and bind only the removal of this exact prompt to our turn.
+        prompt_queue_matches: deque[bool] = deque()
         steer_followup_prompt: str | None = None
         steer_followup_echo_matcher = None
         steer_followup_started = False
@@ -867,23 +869,22 @@ class Session:
                         else None
                     )
                     if not scan_started and operation == "enqueue":
-                        if self._queue_operation_matches_prompt(raw, text):
-                            prompt_enqueued = True
-                        elif prompt_enqueued:
-                            # A contentless remove cannot identify which of
-                            # multiple queued items it consumed. Require an
-                            # adjacent logical queue entry for fail-closed
-                            # attribution to this prompt.
-                            prompt_enqueued = False
-                    elif not scan_started and prompt_enqueued:
-                        if operation == "remove":
+                        prompt_queue_matches.append(
+                            self._queue_operation_matches_prompt(raw, text)
+                        )
+                    elif (
+                        not scan_started
+                        and operation in {"remove", "dequeue"}
+                        and prompt_queue_matches
+                    ):
+                        queued_prompt = prompt_queue_matches.popleft()
+                        if queued_prompt and operation == "remove":
                             scan_started = True
                             prompt_absorb_ids.add(id(raw))
-                            prompt_enqueued = False
-                        elif operation == "dequeue":
+                        elif queued_prompt:
                             # A dequeued prompt starts a distinct turn and
                             # therefore still needs its normal user echo.
-                            prompt_enqueued = False
+                            prompt_queue_matches.clear()
 
                     pending = self._pending_steer
                     if pending is not None:
